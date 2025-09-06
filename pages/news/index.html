@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>חדשות השרת</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: Arial, sans-serif;
+            overflow: hidden;
+            height: 100vh;
+            position: relative;
+        }
+
+        #background-video {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            object-fit: cover;
+            z-index: -1;
+        }
+
+        .news-ticker-container {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            width: 100%;
+            height: 80px;
+            background: linear-gradient(135deg, #dc2626, #b91c1c);
+            display: flex;
+            align-items: center;
+            z-index: 10;
+            box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.5);
+        }
+
+        .news-label {
+            background: rgba(255, 255, 255, 0.95);
+            color: #dc2626;
+            font-weight: bold;
+            font-size: 24px;
+            padding: 15px 25px;
+            margin-left: 0;
+            white-space: nowrap;
+            border-right: 4px solid #dc2626;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            box-shadow: 2px 0 10px rgba(0, 0, 0, 0.3);
+        }
+
+        .news-content {
+            flex: 1;
+            color: white;
+            font-size: 22px;
+            font-weight: bold;
+            padding: 0 20px;
+            overflow: hidden;
+            white-space: nowrap;
+            position: relative;
+            height: 100%;
+            display: flex;
+            align-items: center;
+        }
+
+        .scrolling-text {
+            position: absolute; /* יחס ל-news-content (relative) */
+            left: 0;
+            top: 50%;
+            transform: translateY(-50%);
+            white-space: nowrap;
+            margin: 0;
+            padding: 0;
+            will-change: transform;
+            display: inline-flex; /* ישתף שני עותקים צמודים */
+            gap: 0;
+            overflow: visible;
+        }
+
+        .scrolling-text .part {
+            display: inline-block;
+            margin: 0;
+            padding: 0;
+            white-space: nowrap;
+        }
+
+        /* אנימציה שמזיזה את ה-track ב-50% (רוחב של עותק אחד) => רציפה וללא רווחים */
+        @keyframes marquee {
+            0%   { transform: translateY(-50%) translateX(0); }
+            100% { transform: translateY(-50%) translateX(-50%); }
+        }
+
+        .cube-icon {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            width: 60px;
+            height: 60px;
+            background: linear-gradient(45deg, #3b82f6, #1d4ed8);
+            box-shadow: 
+                2px 2px 0 #1e40af,
+                4px 4px 0 #1e3a8a,
+                6px 6px 20px rgba(0, 0, 0, 0.4);
+            z-index: 15;
+            transform: rotateX(15deg) rotateY(15deg);
+            animation: float 3s ease-in-out infinite;
+        }
+
+        .cube-icon::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(135deg, rgba(255,255,255,0.3), transparent);
+        }
+
+        @keyframes float {
+            0%, 100% {
+                transform: rotateX(15deg) rotateY(15deg) translateY(0px);
+            }
+            50% {
+                transform: rotateX(15deg) rotateY(15deg) translateY(-10px);
+            }
+        }
+
+        .bottom-cube-icon {
+            position: fixed;
+            bottom: 90px;
+            right: 20px;
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(45deg, #3b82f6, #1d4ed8);
+            box-shadow: 
+                2px 2px 0 #1e40af,
+                4px 4px 0 #1e3a8a,
+                4px 4px 15px rgba(0, 0, 0, 0.3);
+            z-index: 15;
+            transform: rotateX(15deg) rotateY(15deg);
+            animation: float 3s ease-in-out infinite 0.5s;
+        }
+
+        .bottom-cube-icon::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(135deg, rgba(255,255,255,0.3), transparent);
+        }
+
+        /* Responsive design */
+        @media (max-width: 768px) {
+            .news-label {
+                font-size: 18px;
+                padding: 12px 15px;
+            }
+            
+            .news-content {
+                font-size: 16px;
+            }
+            
+            .cube-icon {
+                width: 45px;
+                height: 45px;
+                top: 15px;
+                right: 15px;
+            }
+            
+            .bottom-cube-icon {
+                width: 30px;
+                height: 30px;
+                bottom: 85px;
+                right: 15px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Background Video -->
+    <video id="background-video" autoplay muted loop playsinline>
+        <source src="background.mp4" type="video/mp4">
+        Your browser does not support the video tag.
+    </video>
+    <!-- News Ticker -->
+    <div class="news-ticker-container">
+        <div class="news-label">חדשות השרת</div>
+        <div class="news-content">
+            <div class="scrolling-text" id="scrolling-text">
+                <!-- החדשות יוצגו כאן -->
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const scrollingText = document.getElementById('scrolling-text');
+        const newsContent = document.querySelector('.news-content');
+ 
+        const fallbackNews = ["אין חדשות כרגע"];
+ 
+        async function loadAndRenderNews() {
+            let newsArray = null;
+            try {
+                const res = await fetch('/api/news/list');
+                if (res.ok) {
+                    const payload = await res.json().catch(() => null);
+                    if (payload && Array.isArray(payload.news)) newsArray = payload.news;
+                }
+            } catch (err) {
+                // המשך עם גיבוי
+            }
+
+            // הצג רק את הטקסט של כל חדשות (ללא id)
+            const texts = (newsArray && newsArray.length)
+                ? newsArray.map(n => (n && n.text ? n.text : ''))
+                : fallbackNews;
+
+            const single = texts.join(' | ');
+
+            // בונה מחרוזת ארוכה ויוצר שני עותקים זהים צמודים (ללא רווחים מיותרים)
+            function prepareTrack() {
+                // שימוש ב-NBSP סביב ה'|' כדי להבטיח ריווח ושהמפריד לא "יתבלבל" בכיווניות RTL
+                const SEP = '\u00A0|\u00A0';
+
+                // בונים רצף של חדשות (ללא id)
+                let repeated = single;
+                const probe = document.createElement('span');
+                probe.style.visibility = 'hidden';
+                probe.style.whiteSpace = 'nowrap';
+                probe.style.display = 'inline-block';
+                probe.innerText = repeated;
+                document.body.appendChild(probe);
+
+                const minWidth = Math.max(newsContent.offsetWidth * 2, 400);
+                while (probe.offsetWidth < minWidth) {
+                    repeated += SEP + single;
+                    probe.innerText = repeated;
+                }
+
+                // ודא שיש מפריד בסוף הבלוק כדי שלשכפול לא יתחבר בלי קו מפריד
+                const repeatedWithSep = repeated + SEP;
+                probe.innerText = repeatedWithSep;
+                const blockWidth = probe.offsetWidth;
+                document.body.removeChild(probe);
+
+                // בניית שני עותקים צמודים (ללא רווחים בין העותקים עצמם, אך כל בלוק מסתיים במפריד עם NBSP)
+                scrollingText.innerHTML = '';
+                const a = document.createElement('span');
+                a.className = 'part';
+                a.textContent = repeatedWithSep;
+                const b = a.cloneNode(true);
+                scrollingText.appendChild(a);
+                scrollingText.appendChild(b);
+
+                return blockWidth;
+            }
+
+            function startMarquee() {
+                const blockWidth = prepareTrack();
+                const pxPerSec = 30;
+                const duration = Math.max(10, Math.ceil(blockWidth / pxPerSec));
+                scrollingText.style.animation = `marquee ${duration}s linear infinite`;
+                const randomOffset = Math.floor(Math.random() * duration);
+                scrollingText.style.animationDelay = `-${randomOffset}s`;
+            }
+
+            startMarquee();
+         }
+ 
+         loadAndRenderNews();
+         let resizeTimer;
+         window.addEventListener('resize', () => {
+             clearTimeout(resizeTimer);
+             resizeTimer = setTimeout(() => {
+                 scrollingText.style.animation = 'none';
+                 loadAndRenderNews();
+             }, 200);
+         });
+     </script>
+</body>
+</html>
