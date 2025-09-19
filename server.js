@@ -36,7 +36,7 @@ const cors = require('cors');
 
 const corsOptions = {
   origin: function (origin, callback) {
-    const allowedOrigins = ['https://icepvp.xyz', 'http://localhost:3000'];
+    const allowedOrigins = ['https://icepvp.xyz', 'https://www.icepvp.xyz', 'http://localhost:3000'];
     if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
