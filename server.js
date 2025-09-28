@@ -1,11 +1,11 @@
 const express = require('express');
 const path = require('path');
+const { Pool } = require('pg');
+const crypto = require('crypto');
 
 // חדש: נטען משתני סביבה וקישור ל-Postgres
 const dotenv = require('dotenv');
 dotenv.config();
-
-const { Pool } = require('pg');
 
 // קרא חיבור מה-.env: שימוש ב-DATABASE_URL אם קיים, אחרת משתני HOST/USER/PASSWORD/DB/PORT
 const connectionString = process.env.DATABASE_URL || undefined;
@@ -155,22 +155,16 @@ async function ensureTable() {
       )
     `);
 
-    // Update existing foreign key constraint and remove NOT NULL constraint
+    // Ensure orders has items JSONB and cart_token columns
     try {
-      await client.query(`
-        ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_package_id_fkey
-      `);
-      await client.query(`
-        ALTER TABLE orders ADD CONSTRAINT orders_package_id_fkey 
-        FOREIGN KEY (package_id) REFERENCES packages(id) ON DELETE SET NULL
-      `);
-      // Remove NOT NULL constraint from package_id
-      await client.query(`
-        ALTER TABLE orders ALTER COLUMN package_id DROP NOT NULL
-      `);
+      await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS items JSONB`);
+      await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS cart_token VARCHAR(255)`);
+      // Ensure package_id can be null and FK behaviour
+      await client.query(`ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_package_id_fkey`);
+      await client.query(`ALTER TABLE orders ADD CONSTRAINT orders_package_id_fkey FOREIGN KEY (package_id) REFERENCES packages(id) ON DELETE SET NULL`);
+      await client.query(`ALTER TABLE orders ALTER COLUMN package_id DROP NOT NULL`);
     } catch (err) {
-      // Ignore if constraint doesn't exist or can't be modified
-      console.log('Note: Could not update orders constraints');
+      console.log('Note: Could not update orders constraints/columns');
     }
 
     // יצירת טבלת staff
@@ -450,20 +444,24 @@ app.get('/api/verifyme/check', cors(corsOptions), async (req, res) => {
 
 // Helper function to send commands to MCWEBAPI
 async function sendMCCommand(command, server = 'lobby') {
-  const base = process.env.MCWEBAPI_URL || 'http://mc.hfa.tv-hosting.co.il:4023';
+  const rawBase = process.env.MCWEBAPI_URL || 'http://mc.hfa.tv-hosting.co.il:4023';
   const accessToken = process.env.MCWEBAPI_TOKEN;
   
   if (!accessToken) {
     throw new Error('MCWEBAPI_TOKEN not configured');
   }
 
+  // normalize base URL: remove trailing slashes and any trailing '/api'
+  let base = String(rawBase).replace(/\/+$/g, '');
+  base = base.replace(/\/api$/i, '');
+
   // Build URL with server parameter in query string
   const url = `${base}/api/run-command?server=${encodeURIComponent(server)}`;
   
   // Prepare POST parameters
   const params = new URLSearchParams();
-  params.append("access-token", accessToken);
-  params.append("command", command);
+  params.append('access-token', accessToken);
+  params.append('command', command);
   
   console.log('[MCWEBAPI] Sending command request:');
   console.log('  URL:', url);
@@ -476,9 +474,9 @@ async function sendMCCommand(command, server = 'lobby') {
 
   try {
     const response = await _fetch(url, {
-      method: "POST",
+      method: 'POST',
       headers: {
-        "Content-Type": "application/x-www-form-urlencoded"
+        'Content-Type': 'application/x-www-form-urlencoded'
       },
       body: params.toString()
     });
@@ -489,6 +487,13 @@ async function sendMCCommand(command, server = 'lobby') {
 
     const responseText = await response.text();
     console.log('  Response body:', responseText);
+
+    if (!response.ok) {
+      const err = new Error(`MCWEBAPI responded with status ${response.status}`);
+      err.status = response.status;
+      err.body = responseText;
+      throw err;
+    }
 
     return responseText;
   } catch (err) {
@@ -1281,11 +1286,10 @@ app.post('/api/payments/create', cors(corsOptions), async (req, res) => {
     const { paypalOrderId, approvalUrl, isSubscription } = await createPayPalOrder(packageData, userId);
     
     // Store order in database with server info
-    const insertQuery = isSubscription ? 
-      `INSERT INTO orders (package_id, user_id, paypal_subscription_id, amount, status)
-       VALUES ($1, $2, $3, $4, 'pending')` :
-      `INSERT INTO orders (package_id, user_id, paypal_order_id, amount, status)
-       VALUES ($1, $2, $3, $4, 'pending')`;
+    const insertQuery = `
+      INSERT INTO orders (package_id, user_id, paypal_order_id, amount, status)
+      VALUES ($1, $2, $3, $4, 'pending')
+    `;
     
     await pool.query(insertQuery, [packageId, userId, paypalOrderId, packageData.price]);
     
@@ -1305,10 +1309,225 @@ app.post('/api/payments/create', cors(corsOptions), async (req, res) => {
   }
 });
 
+// POST /api/payments/create-cart
+app.post('/api/payments/create-cart', cors(corsOptions), async (req, res) => {
+  const { items, username, cart_token } = req.body || {};
+
+  // Basic validation
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: 'Invalid body: items array is required' });
+  }
+
+  // Try to extract authenticated user id from Bearer JWT if present (no verification)
+  let userId = null;
+  try {
+    const auth = (req.get('authorization') || '').trim();
+    if (auth.toLowerCase().startsWith('bearer ')) {
+      const parts = auth.split(' ');
+      if (parts[1]) {
+        const payload = parts[1].split('.')[1];
+        if (payload) {
+          const decoded = JSON.parse(Buffer.from(payload.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
+          userId = decoded.sub || decoded.user_id || decoded.id || decoded.email || null;
+        }
+      }
+    }
+  } catch (e) {
+    // ignore parse errors
+  }
+
+  // Determine cart token
+  let cartToken = cart_token || null;
+  if (!userId) {
+    if (!cartToken) {
+      cartToken = 'cart_' + crypto.randomBytes(8).toString('hex');
+    }
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Validate items against packages table and compute total
+    let subtotal = 0;
+    const validatedItems = [];
+
+    for (const it of items) {
+      if (!it || !it.id || !Number.isInteger(it.quantity) || it.quantity < 1) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Invalid item format. Each item must include id and integer quantity >=1' });
+      }
+
+      // try to find package by id
+      const pkgRes = await client.query('SELECT id, name, price, payment_type FROM packages WHERE id = $1', [it.id]);
+      if (pkgRes.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: `Item not found: ${it.id}` });
+      }
+
+      const pkg = pkgRes.rows[0];
+      const price = parseFloat(pkg.price || 0);
+      const lineTotal = +(price * it.quantity).toFixed(2);
+      subtotal = +(subtotal + lineTotal).toFixed(2);
+
+      validatedItems.push({ id: pkg.id, name: pkg.name, payment_type: pkg.payment_type, price, quantity: it.quantity, lineTotal });
+    }
+
+    // Create PayPal order (v2) for the computed total
+    const accessToken = await getPayPalAccessToken();
+    const orderPayload = {
+      intent: 'CAPTURE',
+      purchase_units: [{
+        amount: {
+          currency_code: process.env.PAYPAL_CURRENCY || 'ILS',
+          value: subtotal.toFixed(2)
+        },
+        description: 'Cart purchase'
+      }],
+      application_context: {
+        return_url: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/payment/success`,
+        cancel_url: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/payment/cancel`,
+        brand_name: 'IcePVP'
+      }
+    };
+
+    const createRes = await _fetch('https://api-m.sandbox.paypal.com/v2/checkout/orders', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(orderPayload)
+    });
+
+    const createData = await createRes.json();
+    if (!createRes.ok) {
+      await client.query('ROLLBACK');
+      console.error('PayPal create order failed:', createData);
+      return res.status(500).json({ error: 'Failed to create PayPal order' });
+    }
+
+    const paypalOrderId = createData.id;
+    const approvalUrl = (createData.links || []).find(l => l.rel === 'approve')?.href || null;
+
+    // Store order in DB
+    const insertQuery = `
+      INSERT INTO orders (package_id, user_id, paypal_order_id, amount, status, items, cart_token) VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `;
+    const dbUserId = userId || username || null;
+    await client.query(insertQuery, [null, dbUserId, paypalOrderId, subtotal, 'pending', JSON.stringify(validatedItems), cartToken]);
+
+    await client.query('COMMIT');
+
+    return res.json({ order_id: paypalOrderId, approval_url: approvalUrl, cart_token: cartToken });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Helper: finalize order after PayPal capture (idempotent)
+async function finalizeOrderAfterCapture(client, paypalOrderId, server = 'lobby') {
+  // client: a connected pg client
+  const orderRes = await client.query('SELECT * FROM orders WHERE paypal_order_id = $1', [paypalOrderId]);
+  if (orderRes.rows.length === 0) {
+    return { ok: false, code: 404, message: 'Order not found' };
+  }
+
+  const order = orderRes.rows[0];
+  if (order.status === 'completed') {
+    return { ok: true, message: 'Order already completed', order };
+  }
+
+  // Mark completed
+  await client.query('UPDATE orders SET status = $1 WHERE paypal_order_id = $2', ['completed', paypalOrderId]);
+
+  // Execute package commands: if items (cart) => iterate items; otherwise use package_id
+  const results = [];
+  if (order.items) {
+    // order.items expected JSON/JSONB array of { id, quantity, ... }
+    let items = order.items;
+    if (typeof items === 'string') {
+      try { items = JSON.parse(items); } catch (e) { items = []; }
+    }
+
+    for (const it of Array.isArray(items) ? items : []) {
+      if (!it || !it.id) continue;
+      try {
+        const execSummary = await executePackageCommands(it.id, 'initial', order.user_id || order.user_id || null, server || 'lobby');
+        results.push({ package_id: it.id, ok: true, executed: execSummary.count });
+      } catch (e) {
+        results.push({ package_id: it.id, ok: false, error: e.message });
+      }
+    }
+  } else if (order.package_id) {
+    try {
+      const execSummary = await executePackageCommands(order.package_id, 'initial', order.user_id || null, server || 'lobby');
+      results.push({ package_id: order.package_id, ok: true, executed: execSummary.count });
+    } catch (e) {
+      results.push({ package_id: order.package_id, ok: false, error: e.message });
+    }
+  }
+
+  return { ok: true, message: 'Order finalized', order, command_results: results };
+}
+
+// Replace GET /api/payments/success handler with idempotent capture handling
+app.get('/api/payments/success', cors(corsOptions), async (req, res) => {
+  const { token, PayerID, server } = req.query;
+  if (!token || !PayerID) {
+    return res.status(400).send('Missing token or PayerID');
+  }
+
+  const client = await pool.connect();
+  try {
+    const accessToken = await getPayPalAccessToken();
+    const captureResponse = await _fetch(`https://api-m.sandbox.paypal.com/v2/checkout/orders/${token}/capture`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const captureData = await captureResponse.json().catch(() => ({}));
+
+    if (!captureResponse.ok) {
+      const alreadyCaptured = Array.isArray(captureData.details) && captureData.details.some(d => d.issue === 'ORDER_ALREADY_CAPTURED');
+      if (alreadyCaptured) {
+        // finalize order idempotently
+        const finalize = await finalizeOrderAfterCapture(client, token, server || 'lobby');
+        if (!finalize.ok) {
+          return res.status(finalize.code || 500).send(finalize.message || 'Failed to finalize order');
+        }
+        return res.send('Payment already captured; order finalized');
+      }
+
+      console.error('PayPal capture failed:', captureData);
+      return res.status(400).send('PayPal capture failed');
+    }
+
+    // Successful capture: finalize
+    const finalize = await finalizeOrderAfterCapture(client, token, server || 'lobby');
+    if (!finalize.ok) {
+      return res.status(finalize.code || 500).send(finalize.message || 'Failed to finalize order');
+    }
+
+    return res.send('Payment completed successfully');
+  } catch (err) {
+    console.error('Payment success handling error:', err);
+    res.status(500).send('Internal server error');
+  } finally {
+    client.release();
+  }
+});
+
 // POST /api/payments/complete
 app.post('/api/payments/complete', cors(corsOptions), async (req, res) => {
   const { PayerID, token, subscription_id, server } = req.body || {};
-  
   if (!PayerID && !subscription_id) {
     return res.status(400).json({ error: 'PayerID or subscription_id is required' });
   }
@@ -1317,102 +1536,62 @@ app.post('/api/payments/complete', cors(corsOptions), async (req, res) => {
   try {
     let order;
     const orderId = subscription_id || token;
-    
-    // Find order by PayPal order ID or subscription ID
-    const orderResult = await client.query(
-      'SELECT * FROM orders WHERE paypal_order_id = $1 OR paypal_subscription_id = $1',
-      [orderId]
-    );
-    
+    const orderResult = await client.query('SELECT * FROM orders WHERE paypal_order_id = $1 OR paypal_subscription_id = $1', [orderId]);
     if (orderResult.rows.length === 0) {
       return res.status(404).json({ error: 'Order not found' });
     }
-    
     order = orderResult.rows[0];
-    
-    // Check if order is already completed
+
     if (order.status === 'completed') {
-      return res.json({ 
-        message: 'Order already processed', 
-        order_id: orderId,
-        status: 'completed' 
-      });
+      return res.json({ message: 'Order already processed', order_id: orderId, status: 'completed' });
     }
 
     const accessToken = await getPayPalAccessToken();
-    
-    // Handle subscription activation
+
     if (subscription_id) {
-      // Get subscription details to verify it's active
       const subResponse = await _fetch(`https://api-m.sandbox.paypal.com/v1/billing/subscriptions/${subscription_id}`, {
         method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${accessToken}`,
-          'Content-Type': 'application/json'
-        }
+        headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' }
       });
-      
       const subscription = await subResponse.json();
-      
       if (!subResponse.ok || subscription.status !== 'ACTIVE') {
-        return res.status(400).json({ 
-          error: 'Subscription activation failed', 
-          details: subscription.status || 'Unknown error' 
-        });
+        return res.status(400).json({ error: 'Subscription activation failed', details: subscription.status || 'Unknown error' });
       }
-      
-      // Update order status
-      await client.query(
-        'UPDATE orders SET status = $1 WHERE paypal_subscription_id = $2',
-        ['completed', subscription_id]
-      );
-      
+      await client.query('UPDATE orders SET status = $1 WHERE paypal_subscription_id = $2', ['completed', subscription_id]);
     } else {
-      // Handle one-time payment capture
+      // capture order
       const captureResponse = await _fetch(`https://api-m.sandbox.paypal.com/v2/checkout/orders/${token}/capture`, {
         method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${accessToken}`,
-          'Content-Type': 'application/json'
+        headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' }
+      });
+
+      const captureData = await captureResponse.json().catch(() => ({}));
+      if (!captureResponse.ok) {
+        const alreadyCaptured = Array.isArray(captureData.details) && captureData.details.some(d => d.issue === 'ORDER_ALREADY_CAPTURED');
+        if (alreadyCaptured) {
+          const finalize = await finalizeOrderAfterCapture(client, token, server || 'lobby');
+          if (!finalize.ok) {
+            return res.status(finalize.code || 500).json({ error: finalize.message || 'Failed to finalize order' });
+          }
+          return res.json({ message: 'Order already captured; finalized', order_id: orderId, status: 'completed', command_results: finalize.command_results || [] });
         }
-      });
-      
-      const captureData = await captureResponse.json();
-      
-      if (!captureResponse.ok || captureData.status !== 'COMPLETED') {
+
         console.error('PayPal capture failed:', captureData);
-        return res.status(400).json({ 
-          error: 'Payment capture failed', 
-          details: captureData.details || captureData.message 
-        });
+        return res.status(400).json({ error: 'Payment capture failed', details: captureData.details || captureData.message });
       }
-      
-      // Update order status
-      await client.query(
-        'UPDATE orders SET status = $1 WHERE paypal_order_id = $2',
-        ['completed', token]
-      );
-    }
-    
-    // Execute all 'initial' commands for this package
-    const execSummary = await executePackageCommands(order.package_id, 'initial', order.user_id, server || 'lobby');
 
-    if (execSummary.count > 0) {
-      return res.json({
-        message: 'Payment completed and commands executed',
-        order_id: orderId,
-        status: 'completed',
-        command_results: execSummary.results
-      });
+      // capture succeeded - finalize
+      const finalize = await finalizeOrderAfterCapture(client, token, server || 'lobby');
+      if (!finalize.ok) {
+        return res.status(finalize.code || 500).json({ error: finalize.message || 'Failed to finalize order' });
+      }
     }
 
-    return res.json({
-      message: 'Payment completed successfully',
-      order_id: orderId,
-      status: 'completed',
-      note: 'No commands to execute'
-    });
+    // After capture/subscription processing, return success and commands
+    const postOrder = await client.query('SELECT * FROM orders WHERE paypal_order_id = $1 OR paypal_subscription_id = $1', [orderId]);
+    const after = postOrder.rows[0];
 
+    return res.json({ message: 'Payment completed', order_id: orderId, status: 'completed' });
   } catch (err) {
     console.error('Payment completion error:', err);
     res.status(500).json({ error: 'Failed to complete payment' });
@@ -1420,6 +1599,66 @@ app.post('/api/payments/complete', cors(corsOptions), async (req, res) => {
     client.release();
   }
 });
+
+// DELETE /api/news/update
+// body JSON: { "id": 3, "text": "updated text" }
+app.put('/api/news/update', cors(corsOptions), async (req, res) => {
+  const { id, text } = req.body || {};
+  
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: 'Invalid body: id must be a positive integer' });
+  }
+  
+  if (!text || typeof text !== 'string') {
+    return res.status(400).json({ error: 'Invalid body: text is required' });
+  }
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      'UPDATE news SET text = $1 WHERE id = $2 RETURNING *',
+      [text, id]
+    );
+    
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'News not found' });
+    }
+    
+    res.json({ message: 'News updated successfully', news: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'DB error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Debug endpoints to inspect registered routes and liveness
+app.get('/api/_routes', (req, res) => {
+  try {
+    const routes = [];
+    if (app && app._router && Array.isArray(app._router.stack)) {
+      app._router.stack.forEach((layer) => {
+        if (layer.route && layer.route.path) {
+          routes.push({ path: layer.route.path, methods: Object.keys(layer.route.methods) });
+        } else if (layer.name === 'router' && layer.handle && layer.handle.stack) {
+          layer.handle.stack.forEach((l) => {
+            if (l.route && l.route.path) {
+              routes.push({ path: l.route.path, methods: Object.keys(l.route.methods) });
+            }
+          });
+        }
+      });
+    }
+    res.json({ routes });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to list routes', details: e.message });
+  }
+});
+
+app.get('/api/health', (req, res) => res.json({ ok: true }));
+
+// --- BEGIN: Additional endpoints restored from backup (only added, not modifying existing routes) ---
 
 // POST /api/payments/subscription/complete
 app.post('/api/payments/subscription/complete', cors(corsOptions), async (req, res) => {
@@ -1559,7 +1798,7 @@ app.post('/api/payments/paypal-webhook', cors(corsOptions), async (req, res) => 
       }
 
       case 'BILLING.SUBSCRIPTION.PAYMENT.COMPLETED': {
-        const subscriptionId = resource.billing_agreement_id;
+        const subscriptionId = resource.billing_agreement_id || resource.id;
         console.log(`[PAYPAL WEBHOOK] Processing subscription renewal: ${subscriptionId}`);
         
         const orderResult = await pool.query(
@@ -1621,8 +1860,55 @@ app.post('/api/payments/paypal-webhook', cors(corsOptions), async (req, res) => 
   }
 });
 
+// PAYPAL WEBHOOKS (specific endpoints)
+app.post('/api/webhooks/paypal/subscription-cancelled', cors(corsOptions), async (req, res) => {
+  const { subscription_id, server } = req.body || {};
+  if (!subscription_id) return res.status(400).json({ error: 'subscription_id is required' });
+
+  console.log(`[WEBHOOK CANCEL] Processing subscription cancellation: ${subscription_id}, server: ${server || 'lobby'}`);
+
+  const client = await pool.connect();
+  try {
+    const orderResult = await client.query('SELECT * FROM orders WHERE paypal_subscription_id = $1', [subscription_id]);
+    if (orderResult.rows.length === 0) return res.status(404).json({ error: 'Subscription not found' });
+    const order = orderResult.rows[0];
+
+    await client.query('UPDATE orders SET status = $1 WHERE paypal_subscription_id = $2', ['cancelled', subscription_id]);
+    const execSummary = await executePackageCommands(order.package_id, 'expiration', order.user_id, server || 'lobby');
+
+    res.json({ message: 'Subscription cancelled and commands executed', subscription_id, user_id: order.user_id, package_id: order.package_id, command_results: execSummary.results, total_commands: execSummary.count });
+  } catch (err) {
+    console.error('[WEBHOOK CANCEL] Error processing cancellation:', err);
+    res.status(500).json({ error: 'Failed to process subscription cancellation' });
+  } finally { client.release(); }
+});
+
+app.post('/api/webhooks/paypal/subscription-payment', cors(corsOptions), async (req, res) => {
+  const { subscription_id, server } = req.body || {};
+  if (!subscription_id) return res.status(400).json({ error: 'subscription_id is required' });
+
+  console.log(`[WEBHOOK PAYMENT] Processing subscription renewal payment: ${subscription_id}, server: ${server || 'lobby'}`);
+
+  const client = await pool.connect();
+  try {
+    const orderResult = await client.query('SELECT * FROM orders WHERE paypal_subscription_id = $1', [subscription_id]);
+    if (orderResult.rows.length === 0) return res.status(404).json({ error: 'Subscription not found' });
+    const order = orderResult.rows[0];
+
+    if (order.status !== 'completed') {
+      await client.query('UPDATE orders SET status = $1 WHERE paypal_subscription_id = $2', ['completed', subscription_id]);
+    }
+
+    const execSummary = await executePackageCommands(order.package_id, 'renewal', order.user_id, server || 'lobby');
+
+    res.json({ message: 'Subscription renewal processed and commands executed', subscription_id, user_id: order.user_id, package_id: order.package_id, command_results: execSummary.results, total_commands: execSummary.count });
+  } catch (err) {
+    console.error('[WEBHOOK PAYMENT] Error processing renewal:', err);
+    res.status(500).json({ error: 'Failed to process subscription renewal' });
+  } finally { client.release(); }
+});
+
 // STAFF MANAGEMENT CRUD
-// GET /api/staff
 app.get('/api/staff', cors(corsOptions), async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM staff ORDER BY sort_order ASC, id ASC');
@@ -1633,137 +1919,66 @@ app.get('/api/staff', cors(corsOptions), async (req, res) => {
   }
 });
 
-// POST /api/staff
 app.post('/api/staff', cors(corsOptions), async (req, res) => {
   const { name, minecraftName, rank, description } = req.body || {};
-  
-  if (!name || !minecraftName || !rank) {
-    return res.status(400).json({ error: 'Name, minecraftName, and rank are required' });
-  }
+  if (!name || !minecraftName || !rank) return res.status(400).json({ error: 'Name, minecraftName, and rank are required' });
 
   const client = await pool.connect();
   try {
-    // Get the highest sort_order to append new staff at the end
     const { rows: maxRows } = await client.query('SELECT COALESCE(MAX(sort_order), 0) AS max_order FROM staff');
     const nextOrder = (maxRows[0].max_order || 0) + 1;
-
-    const result = await client.query(
-      'INSERT INTO staff (name, minecraft_name, rank, description, sort_order) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [name, minecraftName, rank, description, nextOrder]
-    );
-    
+    const result = await client.query('INSERT INTO staff (name, minecraft_name, rank, description, sort_order) VALUES ($1, $2, $3, $4, $5) RETURNING *', [name, minecraftName, rank, description, nextOrder]);
     res.status(201).json({ staff: result.rows[0] });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'DB error' });
-  } finally {
-    client.release();
-  }
+  } finally { client.release(); }
 });
 
-// PUT /api/staff/:id
 app.put('/api/staff/:id', cors(corsOptions), async (req, res) => {
   const { id } = req.params;
   const { name, minecraftName, rank, description } = req.body || {};
-  
-  if (!name || !minecraftName || !rank) {
-    return res.status(400).json({ error: 'Name, minecraftName, and rank are required' });
-  }
+  if (!name || !minecraftName || !rank) return res.status(400).json({ error: 'Name, minecraftName, and rank are required' });
 
   try {
-    const result = await pool.query(
-      'UPDATE staff SET name = $1, minecraft_name = $2, rank = $3, description = $4 WHERE id = $5 RETURNING *',
-      [name, minecraftName, rank, description, id]
-    );
-    
-    if (result.rowCount === 0) {
-      return res.status(404).json({ error: 'Staff member not found' });
-    }
-    
+    const result = await pool.query('UPDATE staff SET name = $1, minecraft_name = $2, rank = $3, description = $4 WHERE id = $5 RETURNING *', [name, minecraftName, rank, description, id]);
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Staff member not found' });
     res.json({ staff: result.rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'DB error' });
-  }
+  } catch (err) { console.error(err); res.status(500).json({ error: 'DB error' }); }
 });
 
-// DELETE /api/staff/:id
 app.delete('/api/staff/:id', cors(corsOptions), async (req, res) => {
   const { id } = req.params;
-
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-
-    // Delete the staff member
     const deleteResult = await client.query('DELETE FROM staff WHERE id = $1 RETURNING sort_order', [id]);
-    
-    if (deleteResult.rowCount === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Staff member not found' });
-    }
-
+    if (deleteResult.rowCount === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Staff member not found' }); }
     const deletedOrder = deleteResult.rows[0].sort_order;
-
-    // Reorder remaining staff members to fill the gap
-    await client.query(
-      'UPDATE staff SET sort_order = sort_order - 1 WHERE sort_order > $1',
-      [deletedOrder]
-    );
-
+    await client.query('UPDATE staff SET sort_order = sort_order - 1 WHERE sort_order > $1', [deletedOrder]);
     await client.query('COMMIT');
     res.json({ message: 'Staff member deleted successfully' });
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    console.error(err);
-    res.status(500).json({ error: 'DB error' });
-  } finally {
-    client.release();
-  }
+  } catch (err) { await client.query('ROLLBACK').catch(() => {}); console.error(err); res.status(500).json({ error: 'DB error' }); } finally { client.release(); }
 });
 
-// POST /api/staff/reorder
 app.post('/api/staff/reorder', cors(corsOptions), async (req, res) => {
   const { order } = req.body || {};
-  
-  if (!Array.isArray(order)) {
-    return res.status(400).json({ error: 'Order must be an array of objects with id property' });
-  }
-
+  if (!Array.isArray(order)) return res.status(400).json({ error: 'Order must be an array of objects with id property' });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-
-    // Update sort_order for each staff member based on the new order
     for (let i = 0; i < order.length; i++) {
       const { id } = order[i];
-      if (!id) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: 'Each item in order array must have an id property' });
-      }
-
-      await client.query(
-        'UPDATE staff SET sort_order = $1 WHERE id = $2',
-        [i + 1, id]
-      );
+      if (!id) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Each item in order array must have an id property' }); }
+      await client.query('UPDATE staff SET sort_order = $1 WHERE id = $2', [i + 1, id]);
     }
-
     await client.query('COMMIT');
-    
-    // Return updated staff list
     const { rows } = await client.query('SELECT * FROM staff ORDER BY sort_order ASC, id ASC');
     res.json({ staff: rows, message: 'Staff order updated successfully' });
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    console.error(err);
-    res.status(500).json({ error: 'DB error' });
-  } finally {
-    client.release();
-  }
+  } catch (err) { await client.query('ROLLBACK').catch(() => {}); console.error(err); res.status(500).json({ error: 'DB error' }); } finally { client.release(); }
 });
 
 // SHOP STATISTICS ENDPOINTS
-// GET /api/shop/stats/revenue - Total revenue from shop
 app.get('/api/shop/stats/revenue', cors(corsOptions), async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -1782,33 +1997,15 @@ app.get('/api/shop/stats/revenue', cors(corsOptions), async (req, res) => {
     };
     
     res.json({ revenue });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'DB error' });
-  }
+  } catch (err) { console.error(err); res.status(500).json({ error: 'DB error' }); }
 });
 
-// GET /api/shop/stats/packages - Package purchase statistics (percentages)
 app.get('/api/shop/stats/packages', cors(corsOptions), async (req, res) => {
   try {
-    // Get total completed orders
-    const totalResult = await pool.query(`
-      SELECT COUNT(*) as total 
-      FROM orders 
-      WHERE status = 'completed'
-    `);
-    
+    const totalResult = await pool.query(`SELECT COUNT(*) as total FROM orders WHERE status = 'completed'`);
     const totalOrders = parseInt(totalResult.rows[0].total || 0);
-    
-    if (totalOrders === 0) {
-      return res.json({ 
-        package_stats: [],
-        total_orders: 0,
-        message: 'No completed orders found'
-      });
-    }
-    
-    // Get package statistics
+    if (totalOrders === 0) return res.json({ package_stats: [], total_orders: 0, message: 'No completed orders found' });
+
     const { rows } = await pool.query(`
       SELECT 
         p.name as package_name,
@@ -1822,26 +2019,12 @@ app.get('/api/shop/stats/packages', cors(corsOptions), async (req, res) => {
       ORDER BY order_count DESC
       LIMIT 5
     `, [totalOrders]);
-    
-    const packageStats = rows.map(row => ({
-      package_id: row.package_id,
-      package_name: row.package_name,
-      order_count: parseInt(row.order_count || 0),
-      percentage: parseFloat(row.percentage || 0),
-      total_revenue: parseFloat(row.total_revenue || 0)
-    }));
-    
-    res.json({ 
-      package_stats: packageStats,
-      total_orders: totalOrders
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'DB error' });
-  }
+
+    const packageStats = rows.map(row => ({ package_id: row.package_id, package_name: row.package_name, order_count: parseInt(row.order_count || 0), percentage: parseFloat(row.percentage || 0), total_revenue: parseFloat(row.total_revenue || 0) }));
+    res.json({ package_stats: packageStats, total_orders: totalOrders });
+  } catch (err) { console.error(err); res.status(500).json({ error: 'DB error' }); }
 });
 
-// GET /api/shop/stats/customers - Total unique customers who purchased
 app.get('/api/shop/stats/customers', cors(corsOptions), async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -1857,199 +2040,34 @@ app.get('/api/shop/stats/customers', cors(corsOptions), async (req, res) => {
       WHERE status = 'completed'
     `);
     
-    const customerStats = {
-      unique_customers: parseInt(rows[0].unique_customers || 0),
-      total_orders: parseInt(rows[0].total_orders || 0),
-      orders_per_customer: parseFloat(rows[0].orders_per_customer || 0)
-    };
-    
+    const customerStats = { unique_customers: parseInt(rows[0].unique_customers || 0), total_orders: parseInt(rows[0].total_orders || 0), orders_per_customer: parseFloat(rows[0].orders_per_customer || 0) };
     res.json({ customer_stats: customerStats });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'DB error' });
-  }
-});
-
-// PAYPAL WEBHOOK ENDPOINTS
-// POST /api/webhooks/paypal/subscription-cancelled
-app.post('/api/webhooks/paypal/subscription-cancelled', cors(corsOptions), async (req, res) => {
-  const { subscription_id, server } = req.body || {};
-  
-  if (!subscription_id) {
-    return res.status(400).json({ error: 'subscription_id is required' });
-  }
-
-  console.log(`[WEBHOOK CANCEL] Processing subscription cancellation: ${subscription_id}, server: ${server || 'lobby'}`);
-
-  const client = await pool.connect();
-  try {
-    // Find order by PayPal subscription ID
-    const orderResult = await client.query(
-      'SELECT * FROM orders WHERE paypal_subscription_id = $1',
-      [subscription_id]
-    );
-    
-    if (orderResult.rows.length === 0) {
-      console.log(`[WEBHOOK CANCEL] Subscription not found in database: ${subscription_id}`);
-      return res.status(404).json({ error: 'Subscription not found' });
-    }
-    
-    const order = orderResult.rows[0];
-    console.log(`[WEBHOOK CANCEL] Found subscription for user: ${order.user_id}, package: ${order.package_id}`);
-    
-    // Update order status to cancelled
-    await client.query(
-      'UPDATE orders SET status = $1 WHERE paypal_subscription_id = $2',
-      ['cancelled', subscription_id]
-    );
-    
-    console.log(`[WEBHOOK CANCEL] Updated order status to cancelled`);
-    
-    // Execute all 'expiration' commands for this package (cancellation = expiration)
-    const execSummary = await executePackageCommands(order.package_id, 'expiration', order.user_id, server || 'lobby');
-
-    console.log(`[WEBHOOK CANCEL] Executed ${execSummary.count} expiration commands`);
-
-    res.json({
-      message: 'Subscription cancelled and commands executed',
-      subscription_id: subscription_id,
-      user_id: order.user_id,
-      package_id: order.package_id,
-      command_results: execSummary.results,
-      total_commands: execSummary.count
-    });
-
-  } catch (err) {
-    console.error('[WEBHOOK CANCEL] Error processing cancellation:', err);
-    res.status(500).json({ error: 'Failed to process subscription cancellation' });
-  } finally {
-    client.release();
-  }
-});
-
-// POST /api/webhooks/paypal/subscription-payment
-app.post('/api/webhooks/paypal/subscription-payment', cors(corsOptions), async (req, res) => {
-  const { subscription_id, server } = req.body || {};
-  
-  if (!subscription_id) {
-    return res.status(400).json({ error: 'subscription_id is required' });
-  }
-
-  console.log(`[WEBHOOK PAYMENT] Processing subscription renewal payment: ${subscription_id}, server: ${server || 'lobby'}`);
-
-  const client = await pool.connect();
-  try {
-    // Find order by PayPal subscription ID
-    const orderResult = await client.query(
-      'SELECT * FROM orders WHERE paypal_subscription_id = $1',
-      [subscription_id]
-    );
-    
-    if (orderResult.rows.length === 0) {
-      console.log(`[WEBHOOK PAYMENT] Subscription not found in database: ${subscription_id}`);
-      return res.status(404).json({ error: 'Subscription not found' });
-    }
-    
-    const order = orderResult.rows[0];
-    console.log(`[WEBHOOK PAYMENT] Found subscription for user: ${order.user_id}, package: ${order.package_id}`);
-    
-    // Make sure order is in completed status for active subscriptions
-    if (order.status !== 'completed') {
-      await client.query(
-        'UPDATE orders SET status = $1 WHERE paypal_subscription_id = $2',
-        ['completed', subscription_id]
-      );
-      console.log(`[WEBHOOK PAYMENT] Updated order status to completed`);
-    }
-    
-    // Execute all 'renewal' commands for this package
-    const execSummary = await executePackageCommands(order.package_id, 'renewal', order.user_id, server || 'lobby');
-
-    console.log(`[WEBHOOK PAYMENT] Executed ${execSummary.count} renewal commands`);
-
-    res.json({
-      message: 'Subscription renewal processed and commands executed',
-      subscription_id: subscription_id,
-      user_id: order.user_id,
-      package_id: order.package_id,
-      command_results: execSummary.results,
-      total_commands: execSummary.count
-    });
-
-  } catch (err) {
-    console.error('[WEBHOOK PAYMENT] Error processing renewal:', err);
-    res.status(500).json({ error: 'Failed to process subscription renewal' });
-  } finally {
-    client.release();
-  }
+  } catch (err) { console.error(err); res.status(500).json({ error: 'DB error' }); }
 });
 
 // ADMIN ORDER MANAGEMENT ENDPOINTS
-
-// GET /api/admin/orders/list - Paginated order list with filters
 app.get('/api/admin/orders/list', cors(corsOptions), async (req, res) => {
   const page = parseInt(req.query.page) || 1;
   const limit = parseInt(req.query.limit) || 20;
   const offset = (page - 1) * limit;
   const { status, user_id, package_id, sort_by, sort_order } = req.query;
 
-  console.log(`[ADMIN ORDERS] List request - page: ${page}, limit: ${limit}, filters: status=${status}, user_id=${user_id}, package_id=${package_id}`);
-
   try {
-    // Build WHERE clause with filters
-    let whereConditions = [];
-    let queryParams = [];
-    let paramIndex = 1;
-
-    if (status) {
-      whereConditions.push(`o.status = $${paramIndex}`);
-      queryParams.push(status);
-      paramIndex++;
-    }
-
-    if (user_id) {
-      whereConditions.push(`o.user_id ILIKE $${paramIndex}`);
-      queryParams.push(`%${user_id}%`);
-      paramIndex++;
-    }
-
-    if (package_id) {
-      whereConditions.push(`o.package_id = $${paramIndex}`);
-      queryParams.push(package_id);
-      paramIndex++;
-    }
-
+    let whereConditions = []; let queryParams = []; let paramIndex = 1;
+    if (status) { whereConditions.push(`o.status = $${paramIndex}`); queryParams.push(status); paramIndex++; }
+    if (user_id) { whereConditions.push(`o.user_id ILIKE $${paramIndex}`); queryParams.push(`%${user_id}%`); paramIndex++; }
+    if (package_id) { whereConditions.push(`o.package_id = $${paramIndex}`); queryParams.push(package_id); paramIndex++; }
     const whereClause = whereConditions.length > 0 ? `WHERE ${whereConditions.join(' AND ')}` : '';
-
-    // Build ORDER BY clause
     const validSortFields = ['created_at', 'amount', 'status', 'user_id'];
     const sortField = validSortFields.includes(sort_by) ? sort_by : 'created_at';
     const sortDirection = sort_order === 'asc' ? 'ASC' : 'DESC';
 
-    // Get total count for pagination
-    const countQuery = `
-      SELECT COUNT(*) as total
-      FROM orders o
-      LEFT JOIN packages p ON o.package_id = p.id
-      ${whereClause}
-    `;
-    
+    const countQuery = `SELECT COUNT(*) as total FROM orders o LEFT JOIN packages p ON o.package_id = p.id ${whereClause}`;
     const countResult = await pool.query(countQuery, queryParams);
-    const totalOrders = parseInt(countResult.rows[0].total);
+    const totalOrders = parseInt(countResult.rows[0].total || 0);
 
-    // Get paginated orders
     const ordersQuery = `
-      SELECT 
-        o.id,
-        o.user_id,
-        o.paypal_order_id,
-        o.paypal_subscription_id,
-        o.status,
-        o.amount,
-        o.created_at,
-        p.name as package_name,
-        p.payment_type,
-        p.price as package_price
+      SELECT o.id, o.user_id, o.paypal_order_id, o.paypal_subscription_id, o.status, o.amount, o.created_at, p.name as package_name, p.payment_type, p.price as package_price
       FROM orders o
       LEFT JOIN packages p ON o.package_id = p.id
       ${whereClause}
@@ -2060,333 +2078,69 @@ app.get('/api/admin/orders/list', cors(corsOptions), async (req, res) => {
     queryParams.push(limit, offset);
     const ordersResult = await pool.query(ordersQuery, queryParams);
 
-    const pagination = {
-      current_page: page,
-      per_page: limit,
-      total_items: totalOrders,
-      total_pages: Math.ceil(totalOrders / limit),
-      has_next: page < Math.ceil(totalOrders / limit),
-      has_prev: page > 1
-    };
+    const pagination = { current_page: page, per_page: limit, total_items: totalOrders, total_pages: Math.ceil(totalOrders / limit), has_next: page < Math.ceil(totalOrders / limit), has_prev: page > 1 };
 
-    res.json({
-      orders: ordersResult.rows,
-      pagination: pagination,
-      filters_applied: { status, user_id, package_id },
-      sort: { field: sortField, order: sortDirection }
-    });
-
-  } catch (err) {
-    console.error('[ADMIN ORDERS] Error listing orders:', err);
-    res.status(500).json({ error: 'Failed to fetch orders' });
-  }
+    res.json({ orders: ordersResult.rows, pagination, filters_applied: { status, user_id, package_id }, sort: { field: sortField, order: sortDirection } });
+  } catch (err) { console.error('[ADMIN ORDERS] Error listing orders:', err); res.status(500).json({ error: 'Failed to fetch orders' }); }
 });
 
-// GET /api/admin/orders/:id - Detailed view of specific order
 app.get('/api/admin/orders/:id', cors(corsOptions), async (req, res) => {
   const { id } = req.params;
-
-  console.log(`[ADMIN ORDERS] Getting details for order: ${id}`);
-
   try {
-    // Get order with package details
-    const orderQuery = `
-      SELECT 
-        o.*,
-        p.name as package_name,
-        p.short_description,
-        p.markdown_description,
-        p.price as package_price,
-        p.payment_type,
-        p.subscription_interval,
-        c.name as category_name
-      FROM orders o
-      LEFT JOIN packages p ON o.package_id = p.id
-      LEFT JOIN categories c ON p.category_id = c.id
-      WHERE o.id = $1
-    `;
-
+    const orderQuery = `SELECT o.*, p.name as package_name, p.short_description, p.markdown_description, p.price as package_price, p.payment_type, p.subscription_interval, c.name as category_name FROM orders o LEFT JOIN packages p ON o.package_id = p.id LEFT JOIN categories c ON p.category_id = c.id WHERE o.id = $1`;
     const orderResult = await pool.query(orderQuery, [id]);
-
-    if (orderResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Order not found' });
-    }
-
+    if (orderResult.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
     const order = orderResult.rows[0];
-
-    // Get associated package commands if package exists
     let commands = [];
-    if (order.package_id) {
-      const commandsQuery = `
-        SELECT id, type, command, sort_order
-        FROM package_commands
-        WHERE package_id = $1
-        ORDER BY type, sort_order ASC, created_at ASC
-      `;
-      
-      const commandsResult = await pool.query(commandsQuery, [order.package_id]);
-      commands = commandsResult.rows;
-    }
-
-    res.json({
-      order: order,
-      commands: commands
-    });
-
-  } catch (err) {
-    console.error('[ADMIN ORDERS] Error getting order details:', err);
-    res.status(500).json({ error: 'Failed to fetch order details' });
-  }
+    if (order.package_id) { const commandsQuery = `SELECT id, type, command, sort_order FROM package_commands WHERE package_id = $1 ORDER BY type, sort_order ASC, created_at ASC`; const commandsResult = await pool.query(commandsQuery, [order.package_id]); commands = commandsResult.rows; }
+    res.json({ order, commands });
+  } catch (err) { console.error('[ADMIN ORDERS] Error getting order details:', err); res.status(500).json({ error: 'Failed to fetch order details' }); }
 });
 
-// GET /api/admin/orders/stats - Dashboard statistics
 app.get('/api/admin/orders/stats', cors(corsOptions), async (req, res) => {
-  console.log('[ADMIN ORDERS] Getting dashboard statistics');
-
   try {
-    // Status distribution
-    const statusQuery = `
-      SELECT 
-        status,
-        COUNT(*) as count,
-        SUM(amount) as total_amount
-      FROM orders
-      GROUP BY status
-      ORDER BY count DESC
-    `;
+    const statusQuery = `SELECT status, COUNT(*) as count, SUM(amount) as total_amount FROM orders GROUP BY status ORDER BY count DESC`;
     const statusResult = await pool.query(statusQuery);
-
-    // Recent orders (last 10)
-    const recentQuery = `
-      SELECT 
-        o.id,
-        o.user_id,
-        o.status,
-        o.amount,
-        o.created_at,
-        p.name as package_name
-      FROM orders o
-      LEFT JOIN packages p ON o.package_id = p.id
-      ORDER BY o.created_at DESC
-      LIMIT 10
-    `;
+    const recentQuery = `SELECT o.id, o.user_id, o.status, o.amount, o.created_at, p.name as package_name FROM orders o LEFT JOIN packages p ON o.package_id = p.id ORDER BY o.created_at DESC LIMIT 10`;
     const recentResult = await pool.query(recentQuery);
-
-    // Top packages by order count
-    const topPackagesQuery = `
-      SELECT 
-        p.name as package_name,
-        p.id as package_id,
-        COUNT(o.id) as order_count,
-        SUM(o.amount) as total_revenue
-      FROM packages p
-      LEFT JOIN orders o ON p.id = o.package_id
-      GROUP BY p.id, p.name
-      HAVING COUNT(o.id) > 0
-      ORDER BY order_count DESC
-      LIMIT 5
-    `;
+    const topPackagesQuery = `SELECT p.name as package_name, p.id as package_id, COUNT(o.id) as order_count, SUM(o.amount) as total_revenue FROM packages p LEFT JOIN orders o ON p.id = o.package_id GROUP BY p.id, p.name HAVING COUNT(o.id) > 0 ORDER BY order_count DESC LIMIT 5`;
     const topPackagesResult = await pool.query(topPackagesQuery);
-
-    // Overall statistics - Fixed division by zero
-    const overallQuery = `
-      SELECT 
-        COUNT(*) as total_orders,
-        COUNT(DISTINCT user_id) as unique_customers,
-        SUM(CASE WHEN status = 'completed' THEN amount ELSE 0 END) as total_revenue,
-        CASE 
-          WHEN COUNT(CASE WHEN status = 'completed' THEN 1 END) > 0 
-          THEN AVG(CASE WHEN status = 'completed' THEN amount ELSE NULL END)
-          ELSE 0 
-        END as avg_order_value
-      FROM orders
-    `;
+    const overallQuery = `SELECT COUNT(*) as total_orders, COUNT(DISTINCT user_id) as unique_customers, SUM(CASE WHEN status = 'completed' THEN amount ELSE 0 END) as total_revenue, CASE WHEN COUNT(CASE WHEN status = 'completed' THEN 1 END) > 0 THEN AVG(CASE WHEN status = 'completed' THEN amount ELSE NULL END) ELSE 0 END as avg_order_value FROM orders`;
     const overallResult = await pool.query(overallQuery);
-
-    res.json({
-      status_distribution: statusResult.rows.map(row => ({
-        status: row.status,
-        count: parseInt(row.count),
-        total_amount: parseFloat(row.total_amount || 0)
-      })),
-      recent_orders: recentResult.rows,
-      top_packages: topPackagesResult.rows.map(row => ({
-        package_name: row.package_name,
-        package_id: row.package_id,
-        order_count: parseInt(row.order_count),
-        total_revenue: parseFloat(row.total_revenue || 0)
-      })),
-      overall_stats: {
-        total_orders: parseInt(overallResult.rows[0].total_orders || 0),
-        unique_customers: parseInt(overallResult.rows[0].unique_customers || 0),
-        total_revenue: parseFloat(overallResult.rows[0].total_revenue || 0),
-        avg_order_value: parseFloat(overallResult.rows[0].avg_order_value || 0)
-      }
-    });
-
-  } catch (err) {
-    console.error('[ADMIN ORDERS] Error getting statistics:', err);
-    res.status(500).json({ error: 'Failed to fetch order statistics' });
-  }
+    res.json({ status_distribution: statusResult.rows.map(row => ({ status: row.status, count: parseInt(row.count), total_amount: parseFloat(row.total_amount || 0) })), recent_orders: recentResult.rows, top_packages: topPackagesResult.rows.map(row => ({ package_name: row.package_name, package_id: row.package_id, order_count: parseInt(row.order_count), total_revenue: parseFloat(row.total_revenue || 0) })), overall_stats: { total_orders: parseInt(overallResult.rows[0].total_orders || 0), unique_customers: parseInt(overallResult.rows[0].unique_customers || 0), total_revenue: parseFloat(overallResult.rows[0].total_revenue || 0), avg_order_value: parseFloat(overallResult.rows[0].avg_order_value || 0) } });
+  } catch (err) { console.error('[ADMIN ORDERS] Error getting statistics:', err); res.status(500).json({ error: 'Failed to fetch order statistics' }); }
 });
 
-// PUT /api/admin/orders/:id/status - Manual status updates
 app.put('/api/admin/orders/:id/status', cors(corsOptions), async (req, res) => {
-  const { id } = req.params;
-  const { status, reason } = req.body;
-
-  if (!status) {
-    return res.status(400).json({ error: 'Status is required' });
-  }
-
-  const validStatuses = ['pending', 'completed', 'cancelled', 'failed', 'refunded'];
-  if (!validStatuses.includes(status)) {
-    return res.status(400).json({ error: 'Invalid status value' });
-  }
-
-  console.log(`[ADMIN ORDERS] Updating order ${id} status to: ${status}, reason: ${reason || 'N/A'}`);
-
+  const { id } = req.params; const { status, reason } = req.body; if (!status) return res.status(400).json({ error: 'Status is required' }); const validStatuses = ['pending', 'completed', 'cancelled', 'failed', 'refunded']; if (!validStatuses.includes(status)) return res.status(400).json({ error: 'Invalid status value' });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-
-    // Get current order
     const currentOrderResult = await client.query('SELECT * FROM orders WHERE id = $1', [id]);
-    
-    if (currentOrderResult.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Order not found' });
-    }
-
-    const currentOrder = currentOrderResult.rows[0];
-    const oldStatus = currentOrder.status;
-
-    // Update status
-    const updateResult = await client.query(
-      'UPDATE orders SET status = $1 WHERE id = $2 RETURNING *',
-      [status, id]
-    );
-
+    if (currentOrderResult.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Order not found' }); }
+    const currentOrder = currentOrderResult.rows[0]; const oldStatus = currentOrder.status;
+    const updateResult = await client.query('UPDATE orders SET status = $1 WHERE id = $2 RETURNING *', [status, id]);
     const updatedOrder = updateResult.rows[0];
-
     await client.query('COMMIT');
-
-    console.log(`[ADMIN ORDERS] Successfully updated order ${id} from ${oldStatus} to ${status}`);
-
-    res.json({
-      message: 'Order status updated successfully',
-      order: updatedOrder,
-      previous_status: oldStatus,
-      new_status: status,
-      reason: reason || null
-    });
-
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    console.error('[ADMIN ORDERS] Error updating order status:', err);
-    res.status(500).json({ error: 'Failed to update order status' });
-  } finally {
-    client.release();
-  }
+    res.json({ message: 'Order status updated successfully', order: updatedOrder, previous_status: oldStatus, new_status: status, reason: reason || null });
+  } catch (err) { await client.query('ROLLBACK').catch(() => {}); console.error('[ADMIN ORDERS] Error updating order status:', err); res.status(500).json({ error: 'Failed to update order status' }); } finally { client.release(); }
 });
 
-// DELETE /api/admin/orders/:id - Deletes a specific order by ID
 app.delete('/api/admin/orders/:id', cors(corsOptions), async (req, res) => {
-  const { id } = req.params;
-  const { reason } = req.body || {};
-
-  console.log(`[ADMIN ORDERS] Deleting order ${id}, reason: ${reason || 'N/A'}`);
-
-  const client = await pool.connect();
+  const { id } = req.params; const { reason } = req.body || {}; const client = await pool.connect();
   try {
     await client.query('BEGIN');
-
-    // Get order details before deletion for logging
-    const orderResult = await client.query(`
-      SELECT 
-        o.*,
-        p.name as package_name
-      FROM orders o
-      LEFT JOIN packages p ON o.package_id = p.id
-      WHERE o.id = $1
-    `, [id]);
-
-    if (orderResult.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Order not found' });
-    }
-
+    const orderResult = await client.query(`SELECT o.*, p.name as package_name FROM orders o LEFT JOIN packages p ON o.package_id = p.id WHERE o.id = $1`, [id]);
+    if (orderResult.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Order not found' }); }
     const orderToDelete = orderResult.rows[0];
-
-    // Delete the order
     const deleteResult = await client.query('DELETE FROM orders WHERE id = $1 RETURNING id', [id]);
-
-    if (deleteResult.rowCount === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Order not found' });
-    }
-
+    if (deleteResult.rowCount === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Order not found' }); }
     await client.query('COMMIT');
-
-    console.log(`[ADMIN ORDERS] Successfully deleted order ${id} - User: ${orderToDelete.user_id}, Package: ${orderToDelete.package_name}, Amount: ${orderToDelete.amount}`);
-
-    res.json({
-      message: 'Order deleted successfully',
-      deleted_order: {
-        id: orderToDelete.id,
-        user_id: orderToDelete.user_id,
-        package_name: orderToDelete.package_name,
-        amount: orderToDelete.amount,
-        status: orderToDelete.status,
-        created_at: orderToDelete.created_at,
-        paypal_order_id: orderToDelete.paypal_order_id,
-        paypal_subscription_id: orderToDelete.paypal_subscription_id
-      },
-      deletion_reason: reason || null,
-      deleted_at: new Date().toISOString()
-    });
-
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    console.error('[ADMIN ORDERS] Error deleting order:', err);
-    res.status(500).json({ error: 'Failed to delete order' });
-  } finally {
-    client.release();
-  }
+    res.json({ message: 'Order deleted successfully', deleted_order: { id: orderToDelete.id, user_id: orderToDelete.user_id, package_name: orderToDelete.package_name, amount: orderToDelete.amount, status: orderToDelete.status, created_at: orderToDelete.created_at, paypal_order_id: orderToDelete.paypal_order_id, paypal_subscription_id: orderToDelete.paypal_subscription_id }, deletion_reason: reason || null, deleted_at: new Date().toISOString() });
+  } catch (err) { await client.query('ROLLBACK').catch(() => {}); console.error('[ADMIN ORDERS] Error deleting order:', err); res.status(500).json({ error: 'Failed to delete order' }); } finally { client.release(); }
 });
 
-// PUT /api/news/update
-// body JSON: { "id": 3, "text": "updated text" }
-app.put('/api/news/update', cors(corsOptions), async (req, res) => {
-  const { id, text } = req.body || {};
-  
-  if (!Number.isInteger(id) || id < 1) {
-    return res.status(400).json({ error: 'Invalid body: id must be a positive integer' });
-  }
-  
-  if (!text || typeof text !== 'string') {
-    return res.status(400).json({ error: 'Invalid body: text is required' });
-  }
-
-  const client = await pool.connect();
-  try {
-    const result = await client.query(
-      'UPDATE news SET text = $1 WHERE id = $2 RETURNING *',
-      [text, id]
-    );
-    
-    if (result.rowCount === 0) {
-      return res.status(404).json({ error: 'News not found' });
-    }
-    
-    res.json({ message: 'News updated successfully', news: result.rows[0] });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'DB error' });
-  } finally {
-    client.release();
-  }
-});
+// --- END: Additional endpoints restored ---
 
 // אתחול טבלה לפני שמתחילים להקשיב
 ensureTable()
